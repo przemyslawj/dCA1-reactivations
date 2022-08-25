@@ -1,0 +1,1520 @@
+---
+title: "Analyse reactivations - generates Figure 8 and its supplements"
+output: html_notebook
+---
+
+```{r setup}
+library(cowplot)
+library(dplyr)
+library(data.table)
+library(datatrace)
+library(ggplot2)
+library(permuco)
+library(purrr)
+library(raster)
+library(stringr)
+library(tidyr)
+
+source('fixed_effects.R')
+source('traces_input.R')
+source('place_field_utils.R')
+source('plotting_params.R')
+
+pc.two.colours = rev(main.two.colours)
+reactiv.colours = c('#999999', '#85b2e0')
+
+gtheme.light.panel = gtheme +
+    theme(
+        panel.grid.major.y = element_line(color = '#dddddd', size=0.3),
+        panel.grid.minor.y = element_line(color = '#dddddd', size=0.2),
+        panel.grid.major.x = element_blank(),
+        panel.grid.minor.x = element_blank(),
+        panel.background = element_rect(fill = 'white'),
+        strip.background = element_blank(),
+        strip.text = element_text(size = 8))
+
+mutate = dplyr::mutate
+select = dplyr::select
+summarise = dplyr::summarise
+
+trials.meta.df = read.trials.meta(rootdirs)
+mouse.meta.df = read.mouse.meta(rootdirs)
+```
+
+
+```{r utils_for_loading_traces}
+nbins=20
+timebin.dur.msec=200
+prepare.all.traces = function(caimg_result_dir, 
+                              timebin.dur.msec=timebin.dur.msec,
+                              # running speed avg > 4 cm/s in 0.5 s window
+                              mean.run.velocity=3.3, 
+                              event.deconv.threshold=0.2) {
+  data.traces = read.data.trace(caimg_result_dir)
+  data.traces = add.running.col(data.traces, mean.run.velocity, 10)
+  data.traces$date = rep(char2date(data.traces$date[1]), nrow(data.traces))
+  setorder(data.traces, exp_title, trial_id, cell_id, timestamp)
+  detect.events(data.traces, deconv.threshold = event.deconv.threshold)
+
+  data.traces = gauss.smooth.df.var(data.traces, filter.len=20, sigma=5.0)
+
+  data.traces[, moved_distance := cumsum(c(0, norm2(diff(x), diff(y)))),
+              by = .(animal, date, exp_title, trial_id, trial, cell_id)]
+
+  binned.traces = timebin.traces(data.traces,
+                                 timebin.dur.msec=timebin.dur.msec)
+  binned.traces[, trial_time_bin := time_bin - min(time_bin), by=.(exp_title, trial)]
+  binned.traces[, `:=` (zscored_deconv_trace = zscore(deconv_trace),
+                        zscored_trace = zscore(trace),
+                        zscored_smooth_deconv_trace = zscore(smoothed_deconv_trace)),
+                by=.(exp_title, cell_id)]
+   binned.traces = binned.traces %>% 
+     stimbin.traces(x, nbins) %>% 
+     stimbin.traces(y, nbins) %>%
+     as.data.table()
+   binned.traces = bin.responses(binned.traces, get.quantiles.fun(c(0.95, 1.0)), 
+        binned.var = 'smoothed_deconv_trace')
+
+  binned.traces[, atReward := pmin((atReward0 >= 0.5) + (atReward1 >= 0.5), 1)]
+  binned.traces[, is_running := is_running > 0.5]
+  binned.traces[, atReward := (atReward) > 0.5 & (!is_running)]
+  return(binned.traces)
+}
+```
+
+
+# Reactivations at reward
+
+## Utility functions
+
+```{r}
+add.trace.auc = function(df, window.dur.msec = 2000) {
+  # Calculated as the sum of median-subtracted values of the calcium traces within the time window. 
+  window.length = window.dur.msec/timebin.dur.msec
+  auc.filter = rep(1, window.length) # flat kernel
+  df[, auc := stats::filter(pmax(0, trace - median(trace)), auc.filter, sides=2),
+     by=.(animal, date, exp_title, trial_id, exp_title, cell_id)]
+  df
+}
+```
+
+```{r}
+all.locations.df = map_dfr(rootdirs, read_locations)
+
+# Keeps trace only until the time left the rewards: new, old, or later of the two
+cut.trace.until.reactiv = function(traces, reactivation.rew.loc='new') {
+  reactiv.location.df = all.locations.df %>%
+    filter(!is_test) %>%
+    filter(animal == traces$animal[1], date == traces$date[1])
+  location.dist.thr = goal.cell.max.dist
+  
+  if (reactivation.rew.loc == 'new') {
+    reactiv.location.df = filter(reactiv.location.df, location_ordinal == max(location_ordinal))   
+  } else if(reactivation.rew.loc == 'old') {
+    reactiv.location.df = filter(reactiv.location.df, location_ordinal == min(location_ordinal))   
+  } else {# else keep both locations
+    location.dist.thr = 1000
+  }
+  behav.traces = traces[cell_id == traces$cell_id[1],] 
+  max.timestamp.df = behav.traces[
+    (atReward > 0) & norm2(reactiv.location.df$trans_x[1] - x, reactiv.location.df$trans_y[1] - y) < location.dist.thr, 
+         .(cut.timestamp = max(timestamp)),
+         by=.(animal, date, trial, trial_id)]
+  x = traces[max.timestamp.df, on=.(animal, date, trial, trial_id)]
+  res = x[timestamp <= cut.timestamp, ]
+  res[, cut.timestamp := NULL]
+  res
+}
+
+find.reactivation.events = function(traces, 
+                                    reactivation.rew.loc='new') {
+  reactiv.location.df = all.locations.df %>%
+    filter(!is_test) %>%
+    filter(animal == traces$animal[1], date == traces$date[1])
+  location.dist.thr = goal.cell.max.dist
+  
+  if (reactivation.rew.loc == 'new') {
+    reactiv.location.df = filter(reactiv.location.df, location_ordinal == max(location_ordinal)) 
+  } else if (reactivation.rew.loc == 'old') {
+    reactiv.location.df = filter(reactiv.location.df, location_ordinal == min(location_ordinal)) 
+  } else {
+    location.dist.thr = 1000
+  }
+  traces[,nevents_running := 0]
+  traces[(x>0) & (y>0) & (is_running > 0.5),
+         nevents_running := nevents]
+  traces[,
+         `:=` (running_cumsum_events = cumsum(nevents_running),
+               cumsum_events = cumsum(nevents)),
+         by=.(exp_title, trial_id, trial, cell)]
+  traces[, atReactivatedReward := (atReward > 0.5) &  
+           norm2(reactiv.location.df$trans_x[1] - x, reactiv.location.df$trans_y[1] - y) < location.dist.thr]
+  traces[,
+         reactivation_event := (atReward > 0) &
+           # cell must have been active during running before the event
+           (running_cumsum_events > 0) & 
+           (nevents > 0) & 
+           # only consider reactivations at new reward location
+           norm2(reactiv.location.df$trans_x[1] - x, reactiv.location.df$trans_y[1] - y) < location.dist.thr]
+}
+
+calc.immobility.dur = function(is_running_vec) {
+  is_running_vec = replace_na(is_running_vec, 0)
+  immobility.dur = rep(0, length(is_running_vec))
+  immobility.dur[1] = is_running_vec[1] < 0.5
+  for (i in 2:length(immobility.dur)) {
+    is_immobile_i = is_running_vec[i] < 0.5
+    immobility.dur[i] = (immobility.dur[i-1] + 1) * is_immobile_i
+  }
+  immobility.dur
+}
+
+# Count number of separate periods of immobility, ignore gaps shorter than min.immobility.break.bins
+count.immobility.periods = function(immobility_dur, min.immobility.break.bins = 5) {
+  run.end.idx = which(diff(c(immobility_dur, 0)) < 0)
+  ignore.gaps.count = sum(diff(run.end.idx) < min.immobility.break.bins)
+  return(length(run.end.idx) - ignore.gaps.count)
+}
+
+# Calculate total time of immobility during the trial based on result of calc.immobility.dur
+calc.total.trial.immobility.dur = function(immobility_dur) {
+  # Find times of changing from immobility to running
+  run.start.idx = which(diff(c(immobility_dur, 0)) < 0)
+  sum(immobility_dur[run.start.idx]) / (1000 / timebin.dur.msec)
+}
+
+find.reactivation.during.immobility = function(traces, min.immobility.bins = 5) {
+  traces[, nevents_running := 0]
+  traces[(x>0) & (y>0) & (is_running > 0.5),
+         nevents_running := nevents]
+  
+  traces[,
+         immobility_dur := calc.immobility.dur(is_running),
+         by=.(exp_title, trial_id, trial, cell)]
+         
+  traces[,
+         `:=` (running_cumsum_events = cumsum(nevents_running),
+               cumsum_events = nevents),
+         by=.(exp_title, trial_id, trial, cell)]
+  traces[immobility_dur < min.immobility.bins, immobility_dur := 0]
+  traces[,
+         reactivation_event := (is_running < 0.5) &
+           (atReward == 0) &
+           (immobility_dur >= min.immobility.bins) &
+           # cell must have been active during running before the event
+           (running_cumsum_events > 0) & 
+           (nevents > 0) ]
+}
+
+
+make.reactivated.cells.df = function(trial.events.count) {
+  trial1.reactivated.cells = trial.events.count[(reactivation_period > 0.5) & (is_running < 0.5),]
+  if (nrow(trial1.reactivated.cells) == 0) {
+    trial1.reactivated.cells = trial.events.count
+    trial1.reactivated.cells[, `:=` (reactivated = FALSE)]
+  } else {
+    trial1.reactivated.cells[, `:=` (reactivated = total_reactivation_events >= 1, 
+                                 active = total_events_running >= 1)]
+  }
+  trial1.reactivated.cells[, .(animal, date, cell_id, reactivated, active)]
+}
+
+calculate.ratio.between.trials = function(trial.events.reactivated.df) {
+  trial.nos = sort(unique(trial.events.reactivated.df$trial))
+  trial.events.reactivated.df[, trial_ordinal := match(trial, trial.nos)]
+  trial.events.reactivated.df[, total_reactivations_at_reward := max(total_reactivation_events),
+                              by=.(animal, date, exp_title, trial, cell_id, active, reactivated)]
+  active.df = trial.events.reactivated.df[is_running == 1 & active == 1,]
+  if (length(unique(active.df$trial_ordinal)) < 2) {
+    return(data.frame())
+  }
+  pivot_wider(
+      active.df, 
+      id_cols=c('animal', 'date', 'exp_title', 'cell_id', 'active', 'reactivated'),
+      names_from=trial_ordinal,
+      names_prefix='trial.',
+      values_from=c('total_events', 'max.deconv', 'deconv.95p','mean.deconv', 
+                    'max.auc', 'total_reactivations_at_reward', 'gap.to.reactiv')) %>%
+      mutate(events.diff = total_events_trial.2 - total_events_trial.1,
+             max.auc.diff = max.auc_trial.2 - max.auc_trial.1,
+             max.auc.ratio = max.auc_trial.2 / max.auc_trial.1,
+             max.deconv.diff = max.deconv_trial.2 - max.deconv_trial.1,
+             deconv.95p.diff = deconv.95p_trial.2 - deconv.95p_trial.1,
+             max.deconv.ratio = max.deconv_trial.2 / max.deconv_trial.1,
+             deconv.95p.ratio = deconv.95p_trial.2 / deconv.95p_trial.1,
+             mean.deconv.diff = mean.deconv_trial.2 - mean.deconv_trial.1,
+             mean.deconv.ratio = mean.deconv_trial.2 / mean.deconv_trial.1) %>%
+    as.data.table()
+}
+
+```
+
+
+## Example trial and traces
+
+Load example trace
+```{r load_example_trace}
+root_dir = '/mnt/DATA/Prez/cheeseboard-down/down_2/2019-08/'
+animal_name = 'F-BL'
+exp_title='learning'
+day_desc_name = 'learning2 day#1'
+
+day = filter(trials.meta.df, animal == animal_name, day_desc == day_desc_name) %>% pull(date)
+caimg_result_dir = find.caimg.dir(caimg_result_dirs, animal_name, day)
+
+example.binned.traces = prepare.all.traces(caimg_result_dir, timebin.dur.msec=timebin.dur.msec, )[exp_title == 'trial',]
+example.binned.traces[, atReward := pmin((atReward0 >= 0.5) + (atReward1 >= 0.5), 1)]
+```
+
+
+Example path of a mouse towards the rewards
+```{r Figure8A-left}
+reactivated.cellids = c(149, 159)
+cell_ids = c(reactivated.cellids,
+             68, 165) # not reactivated
+
+behav.traces = example.binned.traces[trial == 3 & cell_id == cell_ids[1], ]
+ggplot(behav.traces) +
+  geom_path(mapping=aes(x=x, y=100-y, group=trial_id), alpha=0.6) +
+  geom_rewards(filter(locations.df, is_test==FALSE), animal_name, day, 100,
+               rew.colours = c('current_rew'='red')) +
+  geom_maze_contour(100) +
+  scale_y_continuous(trans='reverse') +
+  theme_nothing()
+ggsave('~/tmp/reactivations/trial_path.svg', units='cm',
+       width = 1.5, height=1.5)
+```
+
+Plot all traces at the reward and its approach
+```{r Figure8A-right}
+bind_rows(
+  example.binned.traces[trial == 3 & cell_id %in% cell_ids & timestamp >= 28000 & timestamp <= 76000, ] %>%
+    mutate(metric='trace'),
+   mutate(behav.traces[timestamp >= 28000 & timestamp <= 76000,], metric='velocity', trace=smooth_velocity) 
+) %>%
+  mutate(trace_group_id = ifelse((cell_id %in% reactivated.cellids) & (metric == 'trace'), '1', ifelse(metric=='velocity', '3', '2'))) %>%
+  ggplot(aes(x=timestamp/1000)) +
+  geom_line(aes(y=trace, color=trace_group_id)) +
+  facet_grid(trace_group_id + metric + cell_id ~ ., scales = 'free_y') +
+  scale_color_manual(values = c(rev(reactiv.colours), "#222222")) +
+  gtheme +
+  xlab('Time (s)') +
+  theme(legend.position = 'none')
+ggsave('~/tmp/reactivations/trial_traces.svg', units='cm',
+       width = 7.9, height=5)
+```
+
+##Utility funs for calculating place fields
+```{r}
+add.meta.cols = function(df, animal, date) {
+  df$animal = as.factor(rep(animal, nrow(df)))
+  df$date = as.factor(rep(date, nrow(df)))
+  return(df)
+}
+
+
+traces2pf.subset = function(subset.binned.traces, subset.name, shuffle.shift.sec = 10, nshuffles = 1000) {
+    if (nrow(subset.binned.traces) == 0) {
+      return(list())
+    }
+
+    subset.result = list()
+    animal = subset.binned.traces$animal[1]
+    date = subset.binned.traces$date[1]
+
+    subset.result = calc.spatial.info(subset.binned.traces,
+                                      generate.plots=FALSE,
+                                      nshuffles=nshuffles,
+                                      shuffle.shift.sec = shuffle.shift.sec,
+                                      trace.var='deconv_trace',
+                                      timebin.dur.msec=timebin.dur.msec,
+                                      nbins=nbins,
+                                      min.occupancy.sec=1,
+                                      gaussian.var=2)
+    subset.result$df = add.meta.cols(subset.result$df, animal, date)
+    return(subset.result)
+  }
+```
+
+
+## Process all trials
+```{r run_on_all_traces}
+last.days.df = test.days.df
+last.days.df$date = last.days.df$date - 1
+
+test.days.df.joined = bind_rows(
+  test.days.df %>% mutate(day_ordinal_name='first'),
+  #last.days.df %>% mutate(day_ordinal_name='last')
+) %>%
+  left_join(trials.meta.df, by=c('animal', 'date')) %>%
+  left_join(mouse.meta.df) %>%
+  filter(implant == 'dCA1') %>%
+  filter(day_desc != 'learning3 day#3', day_desc != 'learning4 day#3') # Ignore days when only 4 trials performed
+
+trial.change.list = list()
+trial.events.list = list()
+beforetest.change.list = list()
+early.late.si.list = list()
+
+for (i in 1:nrow(test.days.df.joined)) {
+  caimg_result_dir = find.caimg.dir(caimg_result_dirs, test.days.df.joined$animal[i], test.days.df.joined$date[i])
+  binned.traces = prepare.all.traces(caimg_result_dir, timebin.dur.msec=200, event.deconv.threshold = 0.2) %>%
+    add.trace.auc()
+  
+  # Reactivations at new reward
+  all.trial.traces = binned.traces[exp_title == 'trial' & (!is.na(is_running)) & (x > 0) & (y > 0),]
+  reactivations.rew.loc.vec = c('other', 'new', 'old', 'both')
+  for (j in seq_along(reactivations.rew.loc.vec)) {
+    reactivations.rew.loc = reactivations.rew.loc.vec[j]
+    
+    trial.traces = all.trial.traces
+    if (reactivations.rew.loc != 'other') {
+      trial.traces = cut.trace.until.reactiv(all.trial.traces, reactivation.rew.loc = reactivations.rew.loc)
+      find.reactivation.events(trial.traces, reactivation.rew.loc = reactivations.rew.loc)
+      reactivation.traces = trial.traces[atReward | ((x>0) & (y>0) & is_running), ]
+      reactivation.traces[, reactivation_period := atReward]
+    } else {
+      find.reactivation.during.immobility(trial.traces)
+      reactivation.traces = trial.traces[(x>0) & (y>0), ]
+      reactivation.traces[, reactivation_period := immobility_dur > 0]
+    }
+    
+    gap.to.reactiv.df = reactivation.traces %>%
+      group_by(animal, date, exp_title, trial_id, trial, cell_id) %>%
+      summarise(reactivated = max(reactivation_event),
+                fst.reactiv.index = which.max(reactivation_event),
+                fst.reactiv.timestamp = timestamp[fst.reactiv.index],
+                last.active.index = which.max(running_cumsum_events == running_cumsum_events[fst.reactiv.index]),
+                last.active.timestamp = timestamp[last.active.index], 
+                .groups='drop') %>%
+      mutate(gap.to.reactiv = fst.reactiv.timestamp - last.active.timestamp) %>%
+      filter(reactivated > 0) %>%
+      dplyr::select(-c('reactivated')) %>%
+      as.data.table()
+    
+    trial.events.count = reactivation.traces[, 
+                                      .(total_events = sum(nevents),
+                                        trial_dur = .N / (1000 / timebin.dur.msec),
+                                        trial_dur_run = sum(is_running) / (1000 / timebin.dur.msec),
+                                        total_reactivation_events = sum(reactivation_event, na.rm=TRUE),
+                                        total_events_running = max(running_cumsum_events, na.rm=TRUE),
+                                        total_immobility_dur = calc.total.trial.immobility.dur(immobility_dur),
+                                        immobility_periods_count = count.immobility.periods(immobility_dur),
+                                        max.auc = max(auc, na.rm=TRUE),
+                                        max.zscored.deconv = max(zscored_deconv_trace, na.rm=TRUE),
+                                        max.deconv = max(deconv_trace, na.rm=TRUE),
+                                        deconv.95p = quantile(deconv_trace, 0.95)[[1]],
+                                        mean.zscored.deconv = mean(zscored_deconv_trace, na.rm=TRUE),
+                                        mean.deconv = mean(deconv_trace, na.rm=TRUE)), 
+                                       by=.(animal, date, exp_title, trial_id, trial, cell_id, reactivation_period, is_running)]
+    
+    trial.events.count = merge(trial.events.count, gap.to.reactiv.df, all=TRUE,
+                               by=c('animal', 'date', 'exp_title', 'trial_id', 'trial', 'cell_id'))
+    trial.events.count[, reactivation.rew.loc := reactivations.rew.loc]
+    trial.events.list[[length(reactivations.rew.loc.vec) * (i - 1) + j]] = trial.events.count
+    trial.events.list[[length(reactivations.rew.loc.vec) * (i - 1) + j]]$day_ordinal_name = test.days.df.joined$day_ordinal_name[i]
+    
+    # 0. take data for two consecutive trials
+    # 1. find reactivated cells in the first trial
+    # 2. merge that with both trial info
+    # 3. calculate ratio over the first trial activity?
+    consecutive.trial.nos = unique(trial.events.count$trial) %>% sort
+    trial.pairs = matrix(c(c(1:7, 1, 1:6), 
+                           c(2:8, 8, 3:8)), nrow=2, byrow = TRUE)
+    trial.change.joined = list()
+    for (pair_index in 1:dim(trial.pairs)[2]) {
+      compared.trials.event.count = trial.events.count[trial %in% trial.pairs[, pair_index], ]
+      if (nrow(compared.trials.event.count[trial == trial.pairs[1, pair_index]]) == 0 |
+          nrow(compared.trials.event.count[trial == trial.pairs[2, pair_index]]) == 0) {
+        next
+      }
+      trial1.reactivated.cells = make.reactivated.cells.df(compared.trials.event.count[trial == trial.pairs[1, pair_index]])
+      trial.events.reactivated = compared.trials.event.count[trial1.reactivated.cells, on=.(animal, date, cell_id) ]
+      trial.change = calculate.ratio.between.trials(trial.events.reactivated) %>% as.data.table()
+      inbetween.reactivated.cells = trial.change[FALSE, .(animal, date, cell_id, exp_title)]
+      inbetween.reactivated.cells$reactivated_inbetween = logical()
+      inbetween.trial.events.df = trial.events.count[trial > trial.pairs[1, pair_index] & trial < trial.pairs[2, pair_index], ];
+      if (nrow(inbetween.trial.events.df) > 0) {
+        inbetween.reactivated.cells = make.reactivated.cells.df(inbetween.trial.events.df)
+        inbetween.reactivated.cells[, active := NULL]
+        # Take max value for reactivated from the two trials
+        inbetween.reactivated.cells = inbetween.reactivated.cells[, .(reactivated = as.logical(max(reactivated))), 
+                                                                  by=.(animal, date, cell_id)]
+        setnames(inbetween.reactivated.cells, 'reactivated', 'reactivated_inbetween')
+      }
+      trial.change = merge(trial.change,
+                           inbetween.reactivated.cells[, .(animal, date, cell_id, reactivated_inbetween)],
+                           by=c('animal', 'date', 'cell_id'), 
+                           all.x = TRUE)
+      if (nrow(trial.change) > 0) {
+        trial.change[is.na(reactivated_inbetween), reactivated_inbetween := FALSE]
+        trial.change$trial.numerator = trial.pairs[2, pair_index]
+        trial.change$trial.denominator = trial.pairs[1, pair_index]
+        trial.change$trials.diff = trial.pairs[2, pair_index] - trial.pairs[1, pair_index]
+      }
+      trial.change.joined[[pair_index]] = trial.change
+    }
+    trial.change.list[[length(reactivations.rew.loc.vec) * (i - 1) + j]] = data.table::rbindlist(trial.change.joined, fill=TRUE)
+    trial.change.list[[length(reactivations.rew.loc.vec) * (i - 1) + j]]$day_ordinal_name = test.days.df.joined$day_ordinal_name[i]
+    trial.change.list[[length(reactivations.rew.loc.vec) * (i - 1) + j]]$reactivation.rew.loc = reactivations.rew.loc
+  }
+  
+  # Early vs late trial place fields
+  half.trial = 5
+  running.trial.traces = all.trial.traces[is_running > 0]
+  early.pf = traces2pf.subset(running.trial.traces[trial < half.trial,], 'early', nshuffles = 1000)
+  late.pf = traces2pf.subset(running.trial.traces[trial >= half.trial,], 'late')
+  if (length(late.pf) > 0) {
+    early.late.si.list[[i]] = bind_rows(
+      early.pf$df %>% mutate(trials_group = 'early'),
+      late.pf$df %>% mutate(trials_group = 'late')) 
+  } else {
+    early.late.si.list[[i]] = NULL
+  }
+    
+}
+
+all.change.from.trial1 = data.table::rbindlist(trial.change.list)
+
+all.change.from.trial1 = all.change.from.trial1 %>% 
+  left_join(mouse.meta.df) %>% 
+  left_join(trials.meta.df)
+
+
+all.trial.events = data.table::rbindlist(trial.events.list)
+all.trial.events = all.trial.events %>%
+  arrange(reactivation.rew.loc, day_ordinal_name, animal, date, exp_title, cell_id, reactivation_period, trial_id, trial) %>%
+  group_by(reactivation.rew.loc, day_ordinal_name, animal, date, exp_title, cell_id, reactivation_period) %>%
+  mutate(max.deconv.norm = max.deconv / max(max.deconv),
+         max.auc.norm = max.auc / max(max.auc)) %>%
+  ungroup() %>% as.data.table()
+
+rm(trial.events.list)
+all.day.events = merge.data.table(all.trial.events, trials.meta.df)[,
+                 .(reactivation_events=sum(total_reactivation_events),
+                   trials_with_reactivation = sum(total_reactivation_events > 0),
+                   events_running = sum(total_events_running)),
+                 by=.(animal, date, day_ordinal_name, location_set, exp_title, cell_id, reactivation_period, reactivation.rew.loc)]
+
+early.late.si = data.table::rbindlist(early.late.si.list)
+```
+```{r}
+# aggregate info about activity during trial excluding reactivation
+all.trial.events.run = all.trial.events %>% 
+  arrange(reactivation.rew.loc, day_ordinal_name, animal, date, exp_title, trial_id, trial, cell_id, 
+          reactivation_period, desc(is_running)) %>%
+  group_by(reactivation.rew.loc, day_ordinal_name, animal, date, exp_title, trial_id, trial, cell_id) %>%
+  dplyr::summarise(reactivation_events = max(total_reactivation_events),
+                   events_running = max(total_events_running),
+                   total_events = sum(total_events, na.rm=TRUE),
+                   mer = total_events / sum(trial_dur, na.rm=TRUE),
+                   max.auc = max.auc[1],
+                   max.auc.norm = max.auc.norm[1],
+                   max.deconv = max.deconv[1],
+                   max.deconv.norm = max.deconv.norm[1],
+                   gap.to.reactiv = gap.to.reactiv[1],
+                    .groups='drop') %>%
+  mutate(reactivated = (reactivation_events) > 0 & (events_running > 0))
+
+all.trial.events.run = all.trial.events.run %>%
+  group_by(reactivation.rew.loc, animal, date, exp_title, cell_id) %>%
+  dplyr::mutate(fst.reactivated.trial = min(c(trial[which(reactivated)], Inf))) %>%
+  ungroup()
+```
+
+
+```{r}
+run.trials.si$date = char2date(run.trials.si$date)
+
+run.trials.si = run.trials.si %>%
+  left_join(mouse.meta.df, by='animal') %>%
+  left_join(trials.meta.df, by=c('date', 'animal'))
+```
+
+```{r calculate early vs late correlations}
+early.late.cell.cor = function(animal_name, day, cell_name) {
+  early.pf = create.partial.df(early.fields, early.occupancies, animal_name, day, cell_name, 'Early')
+  late.pf = create.partial.df(late.fields, late.occupancies, animal_name, day, cell_name, 'Late')
+  if (nrow(late.pf) == 0 || nrow(early.pf) == 0) {
+    return(0)
+  }
+  x = field.cor(early.pf, late.pf, nbins, make.cor.plot=FALSE)
+
+  return(x$cor)
+}
+
+run.trials.si = run.trials.si %>%
+  dplyr::rowwise() %>%
+  dplyr::mutate(early.late.cor = early.late.cell.cor(animal, format(date), cell_id))
+```
+
+```{r}
+place.cell.db = run.trials.si %>%
+  dplyr::select(date, day_desc, exp, animal, cell_id, implant, 
+                spatial.information, si.shuffle.mean, 
+                mutual.info, mutual.info.bias,
+                sparsity, field.size.50, field.size.25, 
+                field.max, field.mean, trace.mean,
+                early.late.cor, signif.mi, signif.si) %>%
+  ungroup()
+place.cell.db = as.data.table(place.cell.db)
+reactivation.summary = all.day.events[reactivation_period>0][place.cell.db, on=.(animal, date, cell_id)]
+```
+
+## Example peaks
+
+Find example peaks
+```{r}
+cell_names = c(149, 159,  # reactivated F-BL
+               309, 279)# not reactivated F-BL, 279 selected
+
+plotted.traces = example.binned.traces[exp_title == 'trial' & cell_id %in% cell_names , ] %>%
+  add.trace.auc()
+example.traces = plotted.traces[atReward | (is_running > 0), ]
+find.reactivation.events(example.traces)
+example.traces = cut.trace.until.reactiv(example.traces, reactivation.rew.loc = 'both')
+example.traces = example.traces[(is_running > 0) | atReactivatedReward]
+
+trace.half.window.sec = 5
+max.deconv.windows.df = example.traces %>%
+  arrange(date, animal, trial, trial_id, atReactivatedReward, cell_id, timestamp) %>%
+  group_by(date, animal, trial, trial_id, atReactivatedReward, cell_id) %>%
+  dplyr::summarise(max.index=which.max(auc),
+                   max.timestamp=timestamp[which.max(auc)],
+                   max.val=max(auc),
+                   len=n(),
+                   index_start = max(1, max.index - trace.half.window.sec / timebin.dur.msec),
+                   has.reactivation=max(reactivation_event), 
+                   .groups='drop') %>%
+  dplyr::select(-c(index_start, max.index)) %>%
+  as.data.table()
+max.deconv.windows.df[, `:=` (exp_title = 'trial', event_id = 1, rew_at_end = atReactivatedReward) ]
+example.traces[, cell_id_tmp := cell_id]
+plotted.traces[, cell_id_tmp := cell_id]
+
+max.deconv.aligned.traces.running = plotted.traces[max.deconv.windows.df[atReactivatedReward==FALSE],
+                                                   on = c('date', 'animal', 'trial', 'trial_id', 'cell_id', 'exp_title')]
+max.deconv.aligned.traces.running[, aligned_timestamp := timestamp - max.timestamp]
+
+max.deconv.aligned.traces.reactivations = plotted.traces[max.deconv.windows.df[atReactivatedReward==TRUE],
+                                                   on = c('date', 'animal', 'trial', 'trial_id', 'cell_id', 'exp_title')]
+max.deconv.aligned.traces.reactivations[, aligned_timestamp := timestamp - max.timestamp]
+```
+
+Plot example peaks during locomotion
+```{r Figure8C-example_peaks}
+bind_rows(
+  max.deconv.aligned.traces.running %>% mutate(atRewardTrace = 0),
+  max.deconv.aligned.traces.reactivations %>% mutate(atRewardTrace = 1)) %>%   
+  left_join(all.trial.events.run %>% filter(reactivation.rew.loc == 'both')) %>%
+  mutate(cell.reactivated = fst.reactivated.trial < Inf) %>%
+  filter(atRewardTrace == 0) %>%
+  filter(aligned_timestamp >= -trace.half.window.sec*1000, aligned_timestamp <= trace.half.window.sec * 1000) %>%
+  ggplot(aes(x=aligned_timestamp / 1000, y=trace)) +
+  geom_line(aes(colour=reactivated)) +
+  facet_grid(cell.reactivated + cell_id ~ trial + atRewardTrace, scales='free_y') +
+  gtheme
+
+ggsave('~/tmp/reactivations/example_traces_M_BR_L2.svg', units = 'cm',
+       width = 20, height = 9.1)
+```
+
+
+
+## Change in max deconv activity and AUC
+
+```{r calc_change_over_trials}
+compared.all.trial.events.run = all.trial.events.run %>%
+  filter(reactivation.rew.loc %in% c('both')) %>%
+  filter(max.deconv.norm > 0 & !is.infinite(max.deconv.norm)) 
+```
+
+Change over time - Figures 8F 
+```{r Figure8F_change_over_time}
+compared.all.trial.events.run %>%
+  filter(fst.reactivated.trial %in% c(1, 4) | is.infinite(fst.reactivated.trial)) %>%
+  mutate(fst.reactivated.trial.noninf = ifelse(is.infinite(fst.reactivated.trial), 0, fst.reactivated.trial),
+         fst.reactivated.trial.factor = as.factor(fst.reactivated.trial.noninf)) %>%
+  group_by(exp_title, fst.reactivated.trial.factor, trial, reactivation.rew.loc) %>%
+  dplyr::summarise(mean.max.deconv.norm = mean((max.deconv.norm), na.rm=TRUE),
+                   sem.max.deconv.norm = sem((max.deconv.norm)),
+                   mean.max.auc.norm = mean((max.auc.norm), na.rm=TRUE),
+                   sem.max.auc.norm = sem((max.auc.norm)),
+                   .groups='drop') %>%
+  ggplot(aes(x=trial, 
+             y=mean.max.auc.norm, 
+             group=fst.reactivated.trial.factor, 
+             colour=fst.reactivated.trial.factor)) +
+  geom_ribbon(aes(ymin=mean.max.auc.norm-sem.max.auc.norm,
+                  ymax=mean.max.auc.norm+sem.max.auc.norm),
+              alpha=0.2, fill = '#666666',
+              color='transparent') +
+  geom_line() +
+  scale_color_manual(values=c(reactiv.colours[1], '#3580cc', '#85b289ff')) +
+  facet_grid(reactivation.rew.loc ~ .) +
+  xlab('Trial') +
+  ylab('Activity peak (norm. AUC)') +
+  labs(color='First trial when\ncells reactivated') +
+  gtheme
+ggsave('~/tmp/reactivations/activity_peaks_norm_lines.svg', units = 'cm',
+       width = 6.9, height = 3.9)
+```
+
+Change over time in place cells and other cells - Figure 8-S1D
+```{r Figure8F_change_over_time_pc}
+compared.all.trial.events.run %>%
+  left_join(place.cell.db) %>%
+  filter(fst.reactivated.trial %in% c(1, 4) | is.infinite(fst.reactivated.trial)) %>%
+  mutate(fst.reactivated.trial.noninf = ifelse(is.infinite(fst.reactivated.trial), 0, fst.reactivated.trial),
+         fst.reactivated.trial.factor = as.factor(fst.reactivated.trial.noninf)) %>%
+  group_by(exp_title, fst.reactivated.trial.factor, trial, signif.si) %>%
+  dplyr::summarise(mean.max.deconv.norm = mean((max.deconv.norm), na.rm=TRUE),
+                   sem.max.deconv.norm = sem((max.deconv.norm)),
+                   mean.max.auc.norm = mean((max.auc.norm), na.rm=TRUE),
+                   sem.max.auc.norm = sem((max.auc.norm)),
+                   .groups='drop') %>%
+  ggplot(aes(x=trial, 
+             y=mean.max.auc.norm, 
+             group=fst.reactivated.trial.factor, 
+             colour=fst.reactivated.trial.factor)) +
+  geom_ribbon(aes(ymin=mean.max.auc.norm-sem.max.auc.norm,
+                  ymax=mean.max.auc.norm+sem.max.auc.norm),
+              alpha=0.2, fill = '#666666',
+              color='transparent') +
+  geom_line() +
+  scale_color_manual(values=c(reactiv.colours[1], '#3580cc', '#85b289ff')) +
+  facet_grid(. ~ signif.si) +
+  xlab('Trial') +
+  ylab('Activity peak (norm. AUC)') +
+  labs(color='First trial when\ncells reactivated') +
+  gtheme
+ggsave('~/tmp/reactivations/activity_peaks_norm_lines_by_pc.svg', units = 'cm',
+       width = 7.6, height = 3.4)
+```
+
+
+Change over time distribution - Figure 8-S1B
+```{r Figure8-S1B-change_over_time_distribution}
+compared.all.trial.events.run %>%
+  filter(fst.reactivated.trial %in% c(1, 2, 3, 4, Inf)) %>%
+  group_by(fst.reactivated.trial, trial) %>%
+  dplyr::mutate(ncells = n()) %>%
+  ungroup() %>%
+  ggplot(aes(x=factor(trial), 
+             y=max.auc.norm,
+             ab=ncells)) +
+  stat_bin2d(
+    geom = 'raster',
+    binwidth = c(1, 0.2),
+    aes(fill = round(100*after_stat(count) / ab)),
+  ) +
+  scale_fill_gradient(trans='log2', limits=c(5,50), breaks=c(10, 20, 40), high='#ffffff', low='#111111') +
+  stat_summary(aes(x=trial, group=fst.reactivated.trial), geom='line', fun=mean, 
+               color='#333333') +
+  facet_grid(. ~ fst.reactivated.trial, scales='free') + 
+  labs(x='Trial', y='Activity peak (norm.)') +
+  scale_y_continuous(breaks=seq(0,1,0.2)) +
+  labs(fill='% of cells') +
+  gtheme
+
+ggsave('~/tmp/reactivations/activity_peak_freq_5.svg', units = 'cm',
+       width = 12.6, height = 4.0)
+```
+
+Change in activity peaks on the trial after first reactivation - Figure 8D left
+```{r Figure8D-left-peaks_after_fst_reactiv}
+d = compared.all.trial.events.run %>%
+  mutate(fst.reactivated.trial_factor = as.factor(fst.reactivated.trial),
+         trial_factor = as.factor(trial),
+         trial_centered = trial - 4.5,
+         is_after_reactiv = trial >= fst.reactivated.trial, 
+         animal_cell_identifier = paste(animal, date, cell_id, sep='_'),
+         animal_trial = paste(animal, date, trial, sep='_'),
+         animal_date = paste(animal, date, sep='_')) 
+d = left_join(d, place.cell.db)
+
+d.nexttrial = d %>%
+  # Balance the reactivated and non-reactivated data start with trial == 2
+  filter(trial > 1) %>% 
+  # non-reactivated or the trial after first reactivation
+  filter(is.infinite(fst.reactivated.trial) | trial == fst.reactivated.trial + 1)
+
+set.seed(42)
+perm.reactiv.m = permuco::aovperm(
+  max.auc.norm ~ trial_factor + is_after_reactiv + Error(animal_date / (trial_factor + is_after_reactiv)),
+  data = d.nexttrial,
+  np = 5000)
+summary(perm.reactiv.m)
+plot(perm.reactiv.m)
+sprintf('%d samples from %d cells', nrow(d.nexttrial),
+        dplyr::select(d.nexttrial, animal, cell_id) %>% distinct() %>% nrow())
+
+d.nexttrial %>%
+  group_by(is_after_reactiv) %>% 
+  summarize(mean(max.auc.norm), sem(max.auc.norm))
+
+binwidth = 0.1
+d.nexttrial %>%
+  group_by(is_after_reactiv) %>%
+  dplyr::summarise(nobservations = n(),
+    counts=hist(max.auc.norm,
+                plot=FALSE, 
+                breaks=seq(0, 1 + binwidth, binwidth))$counts,
+    breaks=seq(binwidth/2, 1.0 + binwidth, binwidth)) %>%
+  dplyr::mutate(freqs = counts/nobservations) %>%
+  ggplot(aes(y=freqs * 100,
+             x=breaks,
+             group=is_after_reactiv,
+             fill=is_after_reactiv)) +
+  geom_col(position='identity', alpha=0.4, color='#666666') +
+  scale_fill_manual(values=reactiv.colours) +
+  scale_color_manual(values=reactiv.colours) +
+  labs(y='Cells (%)', x='Activity peak (norm. AUC)', fill='') +
+  gtheme
+ggsave('~/tmp/reactivations/activity_peaks_norm_hist.svg', units = 'cm',
+       width=6.3, height = 3.3)
+  
+sd_summary <- function(x) {
+  x = x[!is.na(x)]
+  m <- mean(x)
+  ymin = m - sd(x)
+  ymax = m + sd(x)
+  return(c(y=m, ymin=ymin, ymax=ymax))
+}
+
+```
+
+# Change in activity peaks on the trial after first reactivation during non-reward stop
+```{r Figure8D-right-stats-activity_peaks_after_reactiv_nonreward}
+compared.all.trial.events.run.other = all.trial.events.run %>%
+  filter(reactivation.rew.loc %in% c('other')) %>%
+  filter(max.deconv.norm > 0 & !is.infinite(max.deconv.norm)) 
+
+d.other = compared.all.trial.events.run.other %>%
+  mutate(fst.reactivated.trial_factor = as.factor(fst.reactivated.trial),
+         trial_factor = as.factor(trial),
+         trial_centered = trial - 4.5,
+         is_after_reactiv = trial >= fst.reactivated.trial, 
+         animal_cell_identifier = paste(animal, date, cell_id, sep='_'),
+         animal_trial = paste(animal, date, trial, sep='_'),
+         animal_date = paste(animal, date, sep='_')) 
+d.other = left_join(d.other, place.cell.db)
+
+d.other.nexttrial = d.other %>%
+  # Balance the reactivated and non-reactivated data start with trial == 2
+  filter(trial > 1) %>% 
+  # non-reactivated or the trial after first reactivation
+  filter(is.infinite(fst.reactivated.trial) | trial == fst.reactivated.trial + 1)
+
+set.seed(42)
+perm.reactiv.m = permuco::aovperm(
+  max.auc.norm ~ trial_factor + is_after_reactiv + Error(animal_date / (trial_factor + is_after_reactiv)),
+  data = d.other.nexttrial,
+  np = 5000)
+summary(perm.reactiv.m)
+plot(perm.reactiv.m)
+sprintf('%d samples from %d cells', nrow(d.other.nexttrial),
+        select(d.nexttrial, animal, cell_id) %>% distinct() %>% nrow())
+
+count(compared.all.trial.events.run.other, fst.reactivated.trial)
+
+d.other.nexttrial %>%
+  group_by(is_after_reactiv) %>% 
+  summarize(mean(max.auc.norm))
+```
+
+```{r Figure8D-right-activity_peaks_after_reactiv_nonreward}
+d.other.nexttrial %>%
+  filter(reactivation.rew.loc == 'other') %>%
+  group_by(is_after_reactiv) %>%
+  dplyr::summarise(nobservations = n(),
+    counts=hist(max.auc.norm,
+                plot=FALSE, breaks=seq(0, 1 + binwidth, binwidth))$counts,
+    breaks=seq(binwidth/2, 1.0 + binwidth, binwidth)) %>%
+  mutate(freqs = counts/nobservations) %>%
+  ggplot(aes(y=freqs * 100,
+             x=breaks,
+             group=is_after_reactiv,
+             fill=is_after_reactiv)) +
+  geom_col(position='identity', alpha=0.4, color='#666666') +
+  scale_fill_manual(values=reactiv.colours) +
+  scale_color_manual(values=reactiv.colours) +
+  labs(y='Cells (%)', x='Activity peak (norm. AUC)', fill='') +
+  ylim(c(0,17)) +
+  gtheme
+ggsave('~/tmp/reactivations/activity_peaks_norm_hist_nonrew.svg', units = 'cm',
+       width=6.3, height = 3.38)
+```
+
+Count of stops per trial
+```{r nonrew_stops_count}
+all.trial.events %>% 
+  filter(reactivation.rew.loc %in% c('other', 'both')) %>%
+  filter(reactivation_period) %>%
+  dplyr::select(animal, date, reactivation.rew.loc, trial, trial_id, 
+                immobility_periods_count, total_immobility_dur) %>%
+  dplyr::distinct() %>%
+  group_by(reactivation.rew.loc) %>%
+  dplyr::summarise(median(immobility_periods_count),
+                   mean(immobility_periods_count), 
+                   sem(immobility_periods_count),
+                   mean(total_immobility_dur),
+                   sem(total_immobility_dur),
+                   n())
+```
+
+Reactivation rate at reward vs at other locations.
+```{r reactivation_mer}
+# MER of reactivations at rewardLocations or non-reward locations
+all.trial.events %>% 
+  filter(reactivation.rew.loc %in% c('both', 'other'), reactivation_period==1) %>%
+  mutate(reactivation_mer = total_reactivation_events / trial_dur) %>%
+  group_by(reactivation.rew.loc) %>%
+  dplyr::summarise(median(reactivation_mer, na.rm=T), mean(reactivation_mer, na.rm=T), sem(reactivation_mer), n())
+
+```
+
+# Next trial change in peaks in place cells and non-place cells
+Figure 8-S1C
+```{r Figure8-S1C_activity_peaks_after_reactiv_by_pc}
+set.seed(42)
+perm.reactiv.m.bypc = permuco::aovperm(
+  max.auc.norm ~ trial_factor + is_after_reactiv*signif.si + Error(animal_date / (trial_factor + is_after_reactiv)),
+  data = d.nexttrial,
+  np = 5000)
+summary(perm.reactiv.m.bypc)
+
+binwidth = 0.1
+d.nexttrial %>%
+  group_by(is_after_reactiv, signif.si) %>%
+  dplyr::summarise(nobservations = n(),
+    counts=hist(max.auc.norm, #max.deconv.norm, 
+                plot=FALSE, breaks=seq(0, 1 + binwidth, binwidth))$counts,
+    breaks=seq(binwidth/2, 1.0 + binwidth, binwidth)) %>%
+  mutate(freqs = counts/nobservations) %>%
+  ggplot(aes(y=freqs * 100,
+             x=breaks,
+             group=is_after_reactiv,
+             fill=is_after_reactiv)) +
+  geom_col(position='identity', alpha=0.4, color='#666666') +
+  geom_vline(data=d.nexttrial.summary,
+             mapping=aes(xintercept=y, color=is_after_reactiv), 
+             linetype='dashed') +
+  scale_fill_manual(values=reactiv.colours) +
+  facet_grid(. ~ signif.si) +
+  scale_color_manual(values=reactiv.colours) +
+  scale_x_continuous(breaks=c(0, 0.5, 1.0)) +
+  labs(y='Cells (%)', x='Activity peak (norm. AUC)', fill='') +
+  gtheme
+ggsave('~/tmp/reactivations/activity_peaks_norm_hist_bypc.svg', units = 'cm',
+       width=7.5, height = 3.2)
+```
+
+```{r Figure8-S1C-stats_activity_peaks_after_reactiv_by_pc}
+compared.d.over.time = d %>%
+  filter(fst.reactivated.trial %in% c(1, 4, Inf)) 
+
+sprintf('Cell count')
+select(compared.d.over.time, animal, fst.reactivated.trial, cell_id) %>% distinct() %>%
+  count(fst.reactivated.trial)
+
+sprintf('Samples count')
+select(compared.d.over.time, animal, fst.reactivated.trial)  %>%
+  count(fst.reactivated.trial)
+
+compared.trial = 4
+d.wide = d %>%
+  filter(fst.reactivated.trial %in% c(compared.trial, Inf)) %>%
+  pivot_wider(
+    id_cols=c('animal', 'date', 'cell_id', 'fst.reactivated.trial_factor'),
+    values_from = max.auc.norm,
+    names_from = trial_factor)
+
+rownames(d.wide) = paste(d.wide$animal, d.wide$date, d.wide$cell_id, sep='_')
+d.obs.matrix = d.wide %>%
+  dplyr::select(-c(animal, date, cell_id, fst.reactivated.trial_factor))
+
+set.seed(42)
+perm.reactiv.pairwise = permuco::clusterlm(
+  d.obs.matrix ~ fst.reactivated.trial_factor,
+  data = d.wide %>% mutate(animal_date = animal, date, sep='_'),
+  np=5000,
+  test='t',
+  multcomp = 'benjamini_hochberg')
+summary(perm.reactiv.pairwise)
+plot(perm.reactiv.pairwise)
+
+# By pc
+sprintf('Cell count by pc')
+select(compared.d.over.time, animal, fst.reactivated.trial, cell_id, signif.si) %>% distinct() %>%
+  count(fst.reactivated.trial, signif.si)
+
+sprintf('Samples count by pc')
+select(compared.d.over.time, animal, fst.reactivated.trial, signif.si)  %>%
+  count(fst.reactivated.trial, signif.si)
+
+d.wide.pc = d %>%
+  filter(fst.reactivated.trial %in% c(compared.trial, Inf)) %>%
+  left_join(place.cell.db) %>%
+  pivot_wider(
+    id_cols=c('animal', 'date', 'cell_id', 'fst.reactivated.trial_factor', 'signif.si'),
+    values_from = max.auc.norm,
+    names_from = trial_factor)
+
+rownames(d.wide.pc) = paste(d.wide.pc$animal, d.wide.pc$date, d.wide.pc$cell_id, d.wide.pc$signif.si, sep='_')
+d.obs.matrix.pc = d.wide.pc %>%
+  dplyr::select(-c(animal, date, cell_id, fst.reactivated.trial_factor, signif.si))
+
+set.seed(42)
+perm.reactiv.pairwise.pc = permuco::clusterlm(
+  d.obs.matrix.pc ~ signif.si * fst.reactivated.trial_factor,
+  data = d.wide.pc,
+  np=5000,
+  test='t',
+  multcomp = 'benjamini_hochberg')
+summary(perm.reactiv.pairwise.pc)
+plot(perm.reactiv.pairwise.pc)
+
+
+d.nexttrial.summary = group_by(d.nexttrial, is_after_reactiv, signif.si) %>%
+  dplyr::summarise(as_tibble(t(sd_summary(max.auc.norm))),
+                             ncells=n(), .groups='drop') 
+```
+
+
+Comparison of AUC on matched cells
+Compare like-to-like cells as in trial 2 that do that reactivate in trial 2
+like-to-like by peak AUC
+
+Event rates of reactivated and non-reactivated cells
+```{r Figure8-S1A-left-histogram-of-event-rates}
+mer.quantiles = quantile(
+  filter(compared.all.trial.events.run, mer>0) %>% pull(mer), 
+  c(0.0, 0.25, 0.5, 0.75, 1.0))
+
+filter(compared.all.trial.events.run, mer>0) %>% 
+  ggplot(aes(x=mer,
+             color=reactivated, fill=reactivated)) +
+  geom_histogram(aes(y=..count..),
+                 position='identity',
+                 alpha=0.3, binwidth = 0.1) +
+  scale_fill_manual(values=reactiv.colours) +
+  scale_color_manual(values=reactiv.colours) +
+  geom_vline(data=data.frame(mer.quantiles), mapping=aes(xintercept=mer.quantiles)) +
+  facet_wrap(reactivated ~ ., ncol=1) +
+  scale_x_log10() +
+  xlab('Event rate (Hz)') +
+  ylab('Samples') +
+  gtheme
+ggsave('~/tmp/reactivations/mer_distr.svg', units = 'cm',
+       width=6.9, height = 5.3)
+```
+
+
+```{r Figure8-S1A-activity_peaks_in_matched_cells}
+# Selection of cells and trials when they had maximum AUC in trial when first reactivated
+# or had maximum AUC for non-reactivated cell
+max.auc.cells.trial2 = compared.all.trial.events.run %>% 
+  mutate(reference.trial = trial) %>%
+  mutate(mer.quantile.i = purrr::map_dbl(mer, ~ max(2,which(.x <= unname(mer.quantiles))[[1]])),
+         mer.quantile.str = purrr::map_chr(
+           mer.quantile.i, 
+           ~ paste(names(mer.quantiles)[.x-1], names(mer.quantiles)[.x], sep='-'))) %>%
+  filter((fst.reactivated.trial == reference.trial) | (fst.reactivated.trial == Inf)) %>%
+  select(animal, date, cell_id, reference.trial, fst.reactivated.trial, reactivated, mer, mer.quantile.i, mer.quantile.str)
+
+
+# Maximum auc of cells during the following trial
+max.auc.prev.cells = max.auc.cells.trial2 %>% 
+  left_join(compared.all.trial.events.run %>% 
+              dplyr::mutate(prev.trial = trial-1) %>% dplyr::select(-c(reactivated, fst.reactivated.trial)),
+            by=c('animal'='animal', 'date'='date', 'cell_id'='cell_id', 'reference.trial'='prev.trial')) %>% 
+  mutate(is_after_reactiv = trial > fst.reactivated.trial) %>%
+  filter(!is.na(trial))
+
+max.auc.prev.cells.summary = max.auc.prev.cells %>%
+  group_by(reactivated, mer.quantile.i, mer.quantile.str) %>% 
+  dplyr::summarise(m.max.auc.norm = mean(max.auc.norm), ncells=n(),.groups='drop')
+
+seq.breaks = seq(0, 1, 0.1) 
+seq.mids = seq(0.05, 0.95, 0.1)
+max.auc.prev.cells %>%
+  group_by(mer.quantile.str, reactivated) %>%
+  dplyr::summarise(nobservations = n(),
+                   counts=hist(max.auc.norm, plot=FALSE, breaks=seq.breaks)$counts,
+                   breaks=seq.mids, .groups='drop') %>%
+  mutate(pct.cells=counts/nobservations*100) %>%
+  ggplot() +
+  geom_col(aes(x=breaks,
+               y=pct.cells, 
+               fill=reactivated),
+           position='identity', 
+           alpha=0.4, color='#666666') +
+  geom_vline(data=max.auc.prev.cells.summary,
+           mapping=aes(xintercept=m.max.auc.norm, color=reactivated),
+           linetype='dashed') +
+  geom_text(data=max.auc.prev.cells.summary,
+            mapping=aes(0.7, 19 - reactivated*1.9,label=paste0('n=', ncells), color=reactivated)) +
+  scale_fill_manual(values=reactiv.colours) +
+  scale_color_manual(values=reactiv.colours) +
+  facet_wrap(. ~ mer.quantile.str) +
+  ylab('Samples (%)') +
+  xlab('Activity peak (norm. AUC)') +
+  scale_x_continuous(breaks=c(0,0.5,1.0))+
+  gtheme
+ggsave('~/tmp/reactivations/activity_peaks_by_group_norm_hist.svg', units = 'cm',
+       width=7.1, height = 5.3)
+```
+
+```{r Figure8-S1A-stats-activity_peaks_in_matched_cells}
+max.auc.prev.cells$mer.quantile.str = as.factor(max.auc.prev.cells$mer.quantile.str)
+set.seed(42)
+reactiv.per.mer.m = permuco::aovperm(
+  max.auc.norm ~ mer.quantile.str + reactivated + Error(animal_date / (mer.quantile.str + reactivated)),
+  data = max.auc.prev.cells %>% mutate(animal_date = paste(animal,date)),
+  np = 5000)
+summary(reactiv.per.mer.m)
+plot(reactiv.per.mer.m)
+sprintf('ncells %d', select(max.auc.prev.cells, animal, cell_id) %>% distinct %>% nrow)
+```
+
+# Correlation between gap from activation to reactivation and following calcium peaks
+Figure 8E
+```{r Figure8E-corr_temporal_gap_to_reactiv}
+d.nexttrial %>%
+  filter(is_after_reactiv) %>%
+  ggplot(aes(x=gap.to.reactiv/1000,
+             y=max.auc.norm)) +
+  geom_point(alpha=0.45, color=reactiv.colours[2], size=0.9) +
+  xlab('Time to reactivation (s)') +
+  ylab('Activity peak (norm. AUC)') +
+  xlim(c(0, 60)) +
+  gtheme
+
+ggsave('~/tmp/reactivations/Figure8E-gap_from_reactiv_vs_activity_peak.svg', units = 'cm',
+       width=4.0, height = 3.7)
+```
+
+
+# Reactivation at new vs old reward
+
+```{r}
+all.change.combined = bind_rows(
+  all.change.from.trial1 %>% mutate(group='learning'))
+
+min.deconv.activity = 1e-5
+max.trial = 8
+
+all.change.combined = all.change.combined %>%
+  mutate(group_desc = paste0('learning (', reactivation.rew.loc, ' reward)')) %>%
+  arrange(trial.numerator) %>%
+  ungroup() %>%
+  group_by(group, group_desc, reactivation.rew.loc, implant, animal, date, exp_title, cell_id) %>%
+  dplyr::mutate(fst.reactivated.trial = min(c(trial.denominator[which(reactivated)], Inf)),
+                reactivated_later = fst.reactivated.trial < Inf) %>%
+  group_by(group, group_desc, reactivation.rew.loc, implant, animal, date, exp_title, cell_id, trials.diff) %>%
+  dplyr::mutate(reactivation.ordinal = ifelse(reactivated,
+                                              map_dbl(trial.denominator, ~ sum(.x >= trial.denominator[which(reactivated)])),
+                                              0)) %>%
+  dplyr::ungroup() %>%
+  filter(day_ordinal_name == 'first') %>%
+  filter(trials.diff <= 7, trial.numerator <= max.trial)
+  # %>% filter(max.deconv_trial.1 > min.deconv.activity, max.deconv_trial.2 > min.deconv.activity) %>%
+  #filter(deconv.95p_trial.1 > 0, deconv.95p_trial.2 > 0)
+
+all.change.combined$group_desc = factor(
+  all.change.combined$group_desc, 
+  levels=c('learning (new reward)', 'learning (old reward)', 
+           'learning (both reward)', 'learning non-reward'))
+
+non.reactivated.align.trial = 3
+
+x = bind_rows(
+  all.change.combined %>%
+    filter(trials.diff == 1) %>%
+    mutate(fst.reactivated.trial < Inf) %>%
+    filter(!reactivated | trial.denominator == fst.reactivated.trial) %>% # show cells reactivated only during a single trial in absence of other reactivations
+    mutate(aligned.reactiv.trial = fst.reactivated.trial),
+  map_dfr(c(1:7), function(aligned.i) {
+    all.change.combined %>%
+      filter(trials.diff == 1) %>%
+      filter(is.infinite(fst.reactivated.trial)) %>%
+      mutate(aligned.reactiv.trial = aligned.i)
+  })
+) %>%
+  mutate(trial_n = trial.denominator - aligned.reactiv.trial + 1)
+
+```
+
+
+
+```{r Figure8B-pct_reactivated_cells}
+x.reactivated.location = all.change.combined %>%
+  filter(trials.diff == 1) %>%
+  filter(reactivation.rew.loc %in% c('new', 'old', 'other')) %>%
+  dplyr::select(animal, date, day_desc, trial.denominator, cell_id, reactivated, 
+                total_reactivations_at_reward_trial.1, reactivation.rew.loc ) %>%
+  pivot_wider(id_cols = c(animal, date, day_desc, cell_id, trial.denominator ),
+              names_from=reactivation.rew.loc,
+              names_prefix='reactivation.loc.',
+              values_from='reactivated')
+  
+x.reactivated.location.summary = x.reactivated.location %>%
+  filter(!is.na(reactivation.loc.new), !is.na(reactivation.loc.old)) %>%
+  dplyr::group_by(animal, date, day_desc, trial.denominator) %>%
+  dplyr::summarise(ncells = n(), 
+                   new = mean(reactivation.loc.new &!reactivation.loc.old),
+                   previous = mean(reactivation.loc.old & !reactivation.loc.new),
+                   both = mean(reactivation.loc.new & reactivation.loc.old),
+                   other = mean(reactivation.loc.other),
+                   none = mean(!reactivation.loc.new & !reactivation.loc.old & !reactivation.loc.other),
+                   either = mean(reactivation.loc.new | reactivation.loc.old),
+                   .groups='drop') %>%
+  pivot_longer(cols=c(new, previous, both, none, either, other)) 
+
+x.reactivated.location.summary$name = factor(x.reactivated.location.summary$name, 
+                                             levels=c('none','other', 'both', 'new', 'previous', 'either'))
+
+x.reactivated.location.summary %>%
+  group_by(name) %>%
+  dplyr::summarise(mean(value), sem(value))
+  
+x.reactivated.location.summary %>%
+  filter(name %in% c('new', 'previous', 'both', 'other')) %>%
+  ggplot(aes(y=name, x=value)) +
+  geom_jitter(aes(colour=name),
+             width=0, height=0.33, shape=1, alpha=0.3, size=0.5) +
+  geom_boxplot(fill='transparent', outlier.shape = NA, coef=1, color='#333333') +
+  gtheme +
+  scale_x_continuous(labels = scales::percent) +
+  scale_colour_manual(values=c(reactiv.colours[1], reactiv.colours[2], reactiv.colours[2], reactiv.colours[2])) +
+  labs(x='', y='')
+ggsave('~/tmp/reactivations/reactivated_cells.svg', units = 'cm',
+       width = 7.5, height = 3.1)
+```
+
+
+
+# Effect of reactivation on place cells
+
+Early vs late metrics of the cells depending if the cell was reactivated during trial 4.
+```{r}
+place.cell.db = as.data.table(place.cell.db)
+first.reactivated.trial = all.change.from.trial1 %>%
+  filter(reactivation.rew.loc == 'both') %>%
+  filter(trials.diff == 1) %>%
+  group_by(animal, date, day_desc, day_ordinal_name, cell_id) %>%
+  arrange(trial.denominator) %>%
+  dplyr::summarise(fst.reactivated.trial = min(c(trial.denominator[which(reactivated)], Inf)),
+                   gap.to.reactiv = min(c(gap.to.reactiv_trial.1[which.max(reactivated)], Inf)),
+                   active = mean(active),
+                   .groups='drop') %>%
+  left_join(place.cell.db[, .(animal, date, day_desc, cell_id, signif.si, early.late.cor)]) %>%
+  mutate(exp='learning') %>%
+  rename(signif.si.day = signif.si)
+
+first.reactivated.trial %>%
+  group_by(fst.reactivated.trial < Inf) %>%
+  dplyr::summarise(mean(signif.si.day), n(), sum(signif.si.day))
+
+early.late.si$date = as.Date(early.late.si$date)
+compared.early.late.df.trials = early.late.si %>%
+  mutate(exp='learning') %>%
+  left_join(first.reactivated.trial) %>%
+  filter(signif.si.day) %>%
+  filter(day_ordinal_name == 'first')
+
+compared.early.late.pc.df = compared.early.late.df.trials %>%
+  filter(fst.reactivated.trial >= 4) %>%
+  mutate(reactivated = fst.reactivated.trial <= 8,
+         spatial.info.corrected = pmax(0, spatial.information - si.shuffle.mean)) %>%
+  filter(!is.na(reactivated)) # filter rows on last and first day of learning
+
+
+compared.early.late.pc.wide = pivot_wider(
+      compared.early.late.pc.df, 
+      id_cols=c('animal', 'exp', 'date', 'day_desc', 'day_ordinal_name', 'cell_id', 'active', 'reactivated', 'early.late.cor'),
+      names_from=trials_group,
+      values_from=c('field.max', 'spatial.info.corrected', 'trace.mean', 'signif.si',
+                    'field.max.x', 'field.max.y', 'gap.to.reactiv')) %>%
+      mutate(field.max.diff = field.max_late - field.max_early,
+             field.max.ratio = field.max_late / field.max_early,
+             spatial.info.corrected.diff = spatial.info.corrected_late - spatial.info.corrected_early,
+             trace.mean.ratio = trace.mean_late / trace.mean_early,
+             field.shift.distance.cm = perc2dist * norm2(field.max.x_late - field.max.x_early, 
+                                                         field.max.y_late - field.max.y_early)) 
+
+compared.early.late.pc.wide %>%
+  group_by(reactivated) %>%
+  dplyr::summarise(n())
+```
+
+
+Example place field activity changes
+```{r Figure8-S2A-example_place_field_changes}
+all.locations.df = map_dfr(rootdirs, read_locations)
+new.locations.df = all.locations.df %>%
+  group_by(animal, date) %>%
+  filter(!is_test, location_set > 1) %>%
+  filter(location_ordinal == max(location_ordinal)) %>%
+  ungroup()
+
+cell_names = c(
+               44, 105, 109, # reactivated
+               41, 68, 279) # not reactivated
+
+sprintf('Reactivated cell ids:')
+first.reactivated.trial %>%
+  filter(animal==animal_name, day_desc == day_desc_name) %>%
+  filter(fst.reactivated.trial == 4, signif.si.day) %>%
+  filter(cell_id %in% cell_names) %>%
+  pull(cell_id)
+
+cells.df = example.binned.traces[exp_title == 'trial' & cell_id %in% cell_names, ]
+cells.df[, early.trial := ifelse(trial <= 4, 'trial 1-4', 'trial 5-8')]
+animal.new.locations.df = filter(new.locations.df, animal == animal_name, date == cells.df$date[1], !is_test) %>%
+  mutate(loc_id=paste(Well_row, Well_col, sep='x'))
+plotted.locations.df = filter(locations.df, animal == animal_name, date == cells.df$date[1], !is_test) %>%
+  mutate(loc_id=paste(Well_row, Well_col, sep='x'),
+         is.new = loc_id %in% animal.new.locations.df$loc_id,
+         current_loc=is.new) # Workaround for plotting in the right colour
+plotted.locations.df = map_df(unique(cells.df$trial), ~ mutate(plotted.locations.df, trial=.x))
+plotted.locations.df = map_df(cell_names, ~ mutate(plotted.locations.df, cell_id=.x))
+
+g1 = plot.trace.events(cells.df[is_running > 0,], event.var=nevents, event.thr=0.5) +
+  geom_rewards(plotted.locations.df, animal_name, cells.df$date[1], nbins = 100, 
+               rew.colours = c('prev_rew'='gray30', 'current_rew'='grey30'),
+               rew.shape = 1) +
+  facet_grid(early.trial ~ cell_id) +
+  theme(legend.position='none')
+
+ggsave('~/tmp/reactivations/paths_examples.png', g1, units='cm',
+       width=19, height=12)
+
+g2 = map_df(cell_names, function(cell_name) {
+  day = as.character(cells.df$date[1])
+  bind_rows(
+    create.pf.df(early.fields[[animal_name]][[day]][[as.character(cell_name)]],
+               early.occupancies[[animal_name]][[day]][[as.character(cell_name)]],
+               min.occupancy.sec = 0.5) %>% 
+      mutate(trials_group = 'trial 1-4', cell_id = cell_name, animal = animal_name, date = day, day_desc = '1'),
+    create.pf.df(late.fields[[animal_name]][[day]][[as.character(cell_name)]],
+               late.occupancies[[animal_name]][[day]][[as.character(cell_name)]],
+               min.occupancy.sec = 0.5) %>% 
+      mutate(trials_group = 'trial 5-8', cell_id = cell_name, animal = animal_name, date = day, day_desc = '2'))
+  }) %>%
+  day.normalize.fields() %>%
+  plot.pf(max.x=20, max.y=20) +
+  geom_rewards(plotted.locations.df, animal_name, cells.df$date[1], nbins = 20, 
+               rew.colours = c('prev_rew'='gray50', 'current_rew'='grey50'),
+               rew.shape = 1) +
+  facet_grid(trials_group ~ cell_id) +
+  theme(legend.position = 'none')
+cowplot::plot_grid(g1, g2, ncol = 1, rel_heights = 2, 2)
+ggsave('~/tmp/reactivations/pcs_examples.svg', units='cm',
+       width=17, height=15)
+```
+
+
+Cumulative number of cells reactivated by trial
+```{r}
+fst.reactivated.trial_index_nos = c(1:7, Inf)
+first.reactivated.trial %>%
+  mutate(first.reactivated.trial_index = match(fst.reactivated.trial, fst.reactivated.trial_index_nos)) %>%
+  filter(day_ordinal_name == 'first') %>%
+  ggplot(aes(first.reactivated.trial_index)) +
+  stat_ecdf(color='#333333') +
+  xlab('First trial when reactivated') +
+  ylab('Cumulative % of\nreactivated cells') +
+  scale_x_continuous(breaks=1:8+0.5, labels=c(1:7, 'Never'), limits = c(0.5, 8.5)) +
+  scale_y_continuous(labels=scales::percent) +
+  gtheme
+```
+
+## Change in place map peaks
+```{r Figure8-S2B-place_map_peaks}
+compared.early.late.pc.wide.summary = compared.early.late.pc.wide %>%
+  group_by(reactivated) %>%
+  summarise(m.field.max.ratio = mean(field.max.ratio),
+            sem.field.max.ratio = sem(field.max.ratio),
+            m.spatial.info.corrected.diff = mean(spatial.info.corrected.diff), 
+            sem.spatial.info.corrected.diff = sem(spatial.info.corrected.diff),
+            m.early.late.cor = mean(early.late.cor),
+            sem.early.late.cor = sem(early.late.cor))
+compared.early.late.pc.wide.summary
+
+log.breaks = seq(-1.2, 1.2, 0.1) %>% map_dbl(~ 10 ^ .x)
+break.mids = seq(-1.15, 1.15, 0.1) %>% map_dbl(~ 10 ^ .x)
+compared.early.late.pc.wide %>%
+  group_by(reactivated) %>%
+  dplyr::summarise(nobservations = n(),
+                   counts=hist(field.max.ratio, plot=FALSE, breaks=log.breaks)$counts,
+                   breaks=break.mids) %>%
+  filter(counts > 0) %>%
+  mutate(freqs = counts/nobservations) %>%
+  ggplot(aes(y=freqs * 100,
+             x=breaks,
+             group=reactivated,
+             fill=reactivated)) +
+  geom_col(position='identity', alpha=0.4, color='#666666') +
+  geom_vline(data=compared.early.late.pc.wide.summary,
+             mapping=aes(xintercept=m.field.max.ratio, color=reactivated),
+             linetype='dashed') +
+  scale_fill_manual(values=reactiv.colours) +
+  scale_color_manual(values=reactiv.colours) +
+  scale_x_log10() +
+  labs(y='Cells (%)', x='Field peaks ratio', fill='') +
+  gtheme
+
+ggsave('~/tmp/reactivations/Figure8-S2B-place_map_peaks_hist.svg', units = 'cm',
+       width=7.1, height = 3.3)
+
+set.seed(42)
+pc.peak.reactiv.m = permuco::aovperm(
+  field.max.ratio ~ reactivated + Error(animal_date / (reactivated)),
+  data = compared.early.late.pc.wide %>%
+    mutate(animal_date = paste(animal, date, sep='_')),
+  np = 5000)
+summary(pc.peak.reactiv.m)
+
+```
+
+## Change in spatial information
+```{r Figure8-S2C-spatial_info_change}
+seq.breaks = seq(-2, 2, 0.1) 
+seq.mids = seq(-1.95, 1.95, 0.1)
+compared.early.late.pc.wide %>%
+  group_by(reactivated) %>%
+  dplyr::summarise(nobservations = n(),
+                   counts=hist(spatial.info.corrected.diff, plot=FALSE, breaks=seq.breaks)$counts,
+                   breaks=seq.mids) %>%
+  filter(counts > 0) %>%
+  mutate(freqs = counts/nobservations) %>%
+  ggplot(aes(y=freqs * 100,
+             x=breaks,
+             group=reactivated,
+             fill=reactivated)) +
+  geom_col(position='identity', alpha=0.4, color='#666666') +
+  geom_vline(data=compared.early.late.pc.wide.summary,
+           mapping=aes(xintercept=m.spatial.info.corrected.diff, color=reactivated),
+           linetype='dashed') +
+  scale_fill_manual(values=reactiv.colours) +
+  scale_color_manual(values=reactiv.colours) +
+  xlim(c(-0.72, 0.72)) +
+  labs(y='Cells (%)', x='Spatial information change', fill='') +
+  gtheme
+
+ggsave('~/tmp/reactivations/Figure8-S2C-spatial_info_change_hist.svg', units = 'cm',
+       width=7.1, height = 3.3)
+
+compared.early.late.pc.wide %>%
+  group_by(reactivated) %>%
+  dplyr::summarise(mean(spatial.info.corrected.diff), sem(spatial.info.corrected.diff))
+
+set.seed(44)
+pc.si.reactiv.m = permuco::aovperm(
+  spatial.info.corrected.diff ~ reactivated + Error(animal_date / (reactivated)),
+  data = compared.early.late.pc.wide %>%
+    mutate(animal_date = paste(animal, date, sep='_')),
+  np = 5000)
+summary(pc.si.reactiv.m)
+
+```
+
+## Correlation between spatial information change and gap to reactivation
+```{r Figure8-S2D-corr_si_temporal_gap_to_reactiv}
+compared.early.late.pc.wide %>%
+  filter(reactivated) %>%
+  ggplot(aes(x=gap.to.reactiv_late/1000,
+             y=spatial.info.corrected.diff)) +
+  geom_point(color=reactiv.colours[2], size=0.9, shape=1, alpha=0.45) +
+  xlim(c(0,60)) +
+  ylim(c(-1,1)) +
+  xlab('Time to reactivation (s)') +
+  ylab('Spatial information\nchange (a.u.)') +
+  gtheme
+
+ggsave('~/tmp/reactivations/Figure8-S2D-pc_si_vs_temporal_gap.svg', units = 'cm',
+       width=4.2, height = 3.7)
+
+```
+
+## Spatial information in early vs late trials
+```{r}
+compared.early.late.pc.df %>% 
+  group_by(reactivated, trials_group) %>%
+  dplyr::summarise(nobservations = n(),
+                   counts=hist(spatial.info.corrected, plot=FALSE, breaks=seq.breaks)$counts,
+                   breaks=seq.mids) %>%
+  filter(counts > 0) %>%
+  mutate(freqs = counts/nobservations) %>%
+  ggplot(aes(y=freqs * 100,
+             x=breaks,
+             group=reactivated,
+             fill=reactivated)) +
+  geom_col(position='identity', alpha=0.4, color='#666666') +
+  scale_fill_manual(values=reactiv.colours) +
+  scale_color_manual(values=reactiv.colours) +
+  facet_grid(trials_group ~ .) +
+  labs(y='Cells (%)', x='Spatial information', fill='') +
+  gtheme
+
+set.seed(42)
+pc.si.reactiv.m = permuco::aovperm(
+  spatial.info.corrected ~ reactivated + Error(animal_date / (reactivated)),
+  data = compared.early.late.pc.df %>%
+    filter(trials_group == 'late') %>%
+    mutate(animal_date = paste(animal, date, sep='_')),
+  np = 5000)
+summary(pc.si.reactiv.m)
+
+compared.early.late.pc.df %>% 
+  group_by(trials_group, reactivated) %>%
+  dplyr::summarise(mean(spatial.info.corrected), sem(spatial.info.corrected), n())
+```
+
+
+
+## Change in place field stability
+```{r Figure8-S2E-place-map-stability}
+seq.breaks = seq(-1, 1, 0.1) 
+seq.mids = seq(-0.95, 0.95, 0.1)
+compared.early.late.pc.wide %>%
+  group_by(reactivated) %>%
+  dplyr::summarise(nobservations = n(),
+                   counts=hist(early.late.cor, plot=FALSE, breaks=seq.breaks)$counts,
+                   breaks=seq.mids) %>%
+  filter(counts > 0) %>%
+  mutate(freqs = counts/nobservations) %>%
+  ggplot(aes(y=freqs * 100,
+             x=breaks,
+             group=reactivated,
+             fill=reactivated)) +
+  geom_col(position='identity', alpha=0.4, color='#666666') +
+  geom_vline(data=compared.early.late.pc.wide.summary,
+           mapping=aes(xintercept=m.early.late.cor, color=reactivated),
+           linetype='dashed') +
+  scale_fill_manual(values=reactiv.colours) +
+  scale_color_manual(values=reactiv.colours) +
+  xlim(c(-1.0, 1.0)) +
+  labs(y='Cells (%)', x='Early-late correlation', fill='') +
+  gtheme
+
+ggsave('~/tmp/reactivations/Figure8-S2E-pc_cors_hist.svg', units = 'cm',
+       width=7.1, height = 3.3)
+
+set.seed(42)
+pc.cor.reactiv.m = permuco::aovperm(
+  early.late.cor ~ reactivated + Error(animal_date / (reactivated)),
+  data = compared.early.late.pc.wide %>%
+    mutate(animal_date = paste(animal, date, sep='_')),
+  np = 5000)
+summary(pc.cor.reactiv.m)
+
+compared.early.late.pc.df %>% 
+  group_by(reactivated) %>%
+  dplyr::summarise(mean(early.late.cor), sem(early.late.cor), n())
+```
+
+
+
